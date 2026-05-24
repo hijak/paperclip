@@ -36,12 +36,18 @@ type AgentJoinRequestAccepted = JoinRequest & {
     message: string;
     hint?: string;
   }>;
+  nextActions?: Record<string, unknown>;
 };
 
 type InviteOnboardingManifest = {
   invite: InviteSummary;
   onboarding: {
     inviteMessage?: string | null;
+    autoSetup?: {
+      singleCommand?: {
+        command?: string;
+      };
+    };
     connectivity?: {
       guidance?: string;
       connectionCandidates?: string[];
@@ -156,4 +162,23 @@ export const accessApi = {
 
   cancelCliAuthChallenge: (id: string, token: string) =>
     api.post<{ cancelled: boolean; status: string }>(`/cli-auth/challenges/${id}/cancel`, { token }),
+
+  // Fetch launch context from AgentHosting (injected via proxy headers)
+  getAgentHostingLaunchContext: () =>
+    api.get<{
+      available: boolean;
+      agentId: string | null;
+      agentName: string | null;
+      openclawGatewayUrl: string | null;
+    }>("/agenthosting/launch-context"),
+
+  // Auto-onboard from AgentHosting context (creates company + agent)
+  autoOnboardFromAgentHosting: () =>
+    api.post<{
+      success: boolean;
+      redirectUrl: string;
+      companyId: string;
+      companyPrefix: string;
+      agentId: string;
+    }>("/agenthosting/auto-onboard", {}),
 };

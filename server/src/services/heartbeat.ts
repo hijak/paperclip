@@ -709,6 +709,11 @@ function isTrackedLocalChildProcessAdapter(adapterType: string) {
   return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
 }
 
+function canReapWithoutTrackedLocalChild(run: typeof heartbeatRuns.$inferSelect, adapterType: string) {
+  if (adapterType !== "openclaw_gateway") return false;
+  return !run.processPid && !run.processStartedAt && !run.sessionIdBefore && !run.sessionIdAfter;
+}
+
 // A positive liveness check means some process currently owns the PID.
 // On Linux, PIDs can be recycled, so this is a best-effort signal rather
 // than proof that the original child is still alive.
@@ -1810,7 +1815,16 @@ export function heartbeatService(db: Db) {
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      if (tracksLocalChild && run.processPid && isProcessAlive(run.processPid)) {
+      const canReapUntracked = canReapWithoutTrackedLocalChild(run, adapterType);
+      if (!tracksLocalChild && !canReapUntracked) {
+        logger.debug(
+          { runId: run.id, adapterType },
+          "skipping orphan reap for adapter without tracked local child process",
+        );
+        continue;
+      }
+
+      if (run.processPid && isProcessAlive(run.processPid)) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
           const detachedRun = await setRunStatus(run.id, "running", {
@@ -3695,6 +3709,11 @@ export function heartbeatService(db: Db) {
         runningProcesses.delete(run.id);
       }
       await releaseIssueExecutionAndPromote(run);
+    }
+
+    if (runs.length > 0) {
+      await finalizeAgentStatus(agentId, "cancelled");
+      await startNextQueuedRunForAgent(agentId);
     }
 
     return runs.length;

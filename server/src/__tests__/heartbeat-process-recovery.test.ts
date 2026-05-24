@@ -252,4 +252,74 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBeNull();
     expect(run?.error).toBeNull();
   });
+
+  it("reaps clearly orphaned openclaw_gateway runs after the staleness threshold", async () => {
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.error).toContain("server may have restarted");
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("failed");
+    expect(wakeup?.error).toContain("server may have restarted");
+  });
+
+  it("updates agent status to idle when cancelling ghost queued/running work", async () => {
+    const { companyId, agentId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      includeIssue: false,
+    });
+    const queuedRunId = randomUUID();
+    const queuedWakeupId = randomUUID();
+
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeupId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: {},
+      status: "queued",
+      runId: queuedRunId,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: queuedWakeupId,
+      contextSnapshot: {},
+    });
+
+    await db.update(agents).set({ status: "running" }).where(eq(agents.id, agentId));
+
+    const heartbeat = heartbeatService(db);
+    const cancelled = await heartbeat.cancelActiveForAgent(agentId);
+    expect(cancelled).toBe(2);
+
+    const agent = await db
+      .select()
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(agent?.status).toBe("idle");
+  });
 });

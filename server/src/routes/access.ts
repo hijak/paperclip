@@ -15,7 +15,9 @@ import {
   agentApiKeys,
   authUsers,
   invites,
-  joinRequests
+  joinRequests,
+  companies,
+  agents as agentsTable,
 } from "@paperclipai/db";
 import {
   acceptInviteSchema,
@@ -45,7 +47,8 @@ import {
   boardAuthService,
   deduplicateAgentName,
   logActivity,
-  notifyHireApproved
+  notifyHireApproved,
+  secretService,
 } from "../services/index.js";
 import { assertCompanyAccess } from "./authz.js";
 import {
@@ -988,7 +991,7 @@ function buildOnboardingConnectionCandidates(input: {
   return Array.from(candidates);
 }
 
-function buildInviteOnboardingManifest(
+export function buildInviteOnboardingManifest(
   req: Request,
   token: string,
   invite: typeof invites.$inferSelect,
@@ -1010,6 +1013,11 @@ function buildInviteOnboardingManifest(
   const onboardingTextUrl = baseUrl
     ? `${baseUrl}${onboardingTextPath}`
     : onboardingTextPath;
+  const claimEndpointTemplatePath =
+    "/api/join-requests/{requestId}/claim-api-key";
+  const claimEndpointTemplateUrl = baseUrl
+    ? `${baseUrl}${claimEndpointTemplatePath}`
+    : claimEndpointTemplatePath;
   const discoveryDiagnostics = buildOnboardingDiscoveryDiagnostics({
     apiBaseUrl: baseUrl,
     deploymentMode: opts.deploymentMode,
@@ -1022,12 +1030,18 @@ function buildInviteOnboardingManifest(
     bindHost: opts.bindHost,
     allowedHostnames: opts.allowedHostnames
   });
+  const defaultPaperclipApiUrl = connectionCandidates[0] ?? baseUrl ?? null;
+  const autoSetupCommand = `paperclip_url=${JSON.stringify(
+    defaultPaperclipApiUrl ?? "<paperclip-api-url>"
+  )}; invite_accept=${JSON.stringify(
+    registrationEndpointUrl
+  )}; agent_name=\${OPENCLAW_AGENT_NAME:-OpenClaw}; gateway_url=\${OPENCLAW_GATEWAY_URL:-ws://127.0.0.1:18789}; token=\${OPENCLAW_GATEWAY_TOKEN:-$(node -p 'require(process.env.HOME+"/.openclaw/openclaw.json").gateway.auth.token')}; test -n "$token" && test "\${#token}" -ge 16 || { echo "Missing or short OPENCLAW_GATEWAY_TOKEN" >&2; exit 1; }; body=$(node -e 'const [agentName,gatewayUrl,paperclipApiUrl,token]=process.argv.slice(1); process.stdout.write(JSON.stringify({requestType:"agent",agentName,adapterType:"openclaw_gateway",capabilities:"OpenClaw Gateway agent",agentDefaultsPayload:{url:gatewayUrl,paperclipApiUrl,headers:{"x-openclaw-token":token},waitTimeoutMs:120000,sessionKeyStrategy:"issue",role:"operator",scopes:["operator.admin"]}}));' "$agent_name" "$gateway_url" "$paperclip_url" "$token"); curl -fsS -X POST "$invite_accept" -H 'content-type: application/json' --data "$body"`;
 
   return {
     invite: toInviteSummaryResponse(req, token, invite),
     onboarding: {
       instructions:
-        "Join as an OpenClaw Gateway agent, save your one-time claim secret, wait for board approval, then claim your API key. Save the claim response token to ~/.openclaw/workspace/paperclip-claimed-api-key.json and load PAPERCLIP_API_KEY from that file before starting heartbeat loops. You MUST submit adapterType='openclaw_gateway', set agentDefaultsPayload.url to your ws:// or wss:// OpenClaw gateway endpoint, and include agentDefaultsPayload.headers.x-openclaw-token (or legacy x-openclaw-auth).",
+        "Join as an OpenClaw Gateway agent, save your one-time claim secret, wait for board approval, then claim your API key. Save the claim response token to ~/.openclaw/workspace/paperclip-agent-keys/<agent-name>.json (and optionally the legacy ~/.openclaw/workspace/paperclip-claimed-api-key.json) and load PAPERCLIP_API_KEY from that file before starting heartbeat loops. You MUST submit adapterType='openclaw_gateway', set agentDefaultsPayload.url to your ws:// or wss:// OpenClaw gateway endpoint, and include agentDefaultsPayload.headers.x-openclaw-token (or legacy x-openclaw-auth).",
       inviteMessage: extractInviteMessage(invite),
       recommendedAdapterType: "openclaw_gateway",
       requiredFields: {
@@ -1038,6 +1052,71 @@ function buildInviteOnboardingManifest(
         agentDefaultsPayload:
           "Adapter config for OpenClaw gateway. MUST include url (ws:// or wss://) and headers.x-openclaw-token (or legacy x-openclaw-auth). Optional fields: paperclipApiUrl, waitTimeoutMs, sessionKeyStrategy, sessionKey, role, scopes, disableDeviceAuth, devicePrivateKeyPem."
       },
+      autoSetup: {
+        version: 1,
+        purpose:
+          "Machine-readable OpenClaw Gateway setup payload. Safe to execute locally in the OpenClaw runtime; it submits a join request only. Board/admin approval is still required before API-key claim succeeds.",
+        humanApprovalBoundary:
+          "Submitting creates/replays a join request. Paperclip does not create a working agent API key until a board/admin approves that join request.",
+        registration: {
+          method: "POST",
+          path: registrationEndpointPath,
+          url: registrationEndpointUrl,
+          contentType: "application/json",
+          bodyTemplate: {
+            requestType: "agent",
+            agentName: "${OPENCLAW_AGENT_NAME:-OpenClaw}",
+            adapterType: "openclaw_gateway",
+            capabilities: "OpenClaw Gateway agent",
+            agentDefaultsPayload: {
+              url: "${OPENCLAW_GATEWAY_URL:-ws://127.0.0.1:18789}",
+              paperclipApiUrl:
+                defaultPaperclipApiUrl ??
+                "<Paperclip base URL reachable from OpenClaw>",
+              headers: {
+                "x-openclaw-token":
+                  "${OPENCLAW_GATEWAY_TOKEN or ~/.openclaw/openclaw.json gateway.auth.token}"
+              },
+              waitTimeoutMs: 120000,
+              sessionKeyStrategy: "issue",
+              role: "operator",
+              scopes: ["operator.admin"]
+            }
+          }
+        },
+        claim: {
+          method: "POST",
+          pathTemplate: claimEndpointTemplatePath,
+          urlTemplate: claimEndpointTemplateUrl,
+          bodyTemplate: {
+            claimSecret:
+              "one-time claim secret returned by the registration response"
+          },
+          allowedAfter: "joinRequest.status == 'approved'",
+          outputPaths: {
+            perAgent:
+              "~/.openclaw/workspace/paperclip-agent-keys/<agent-name>.json",
+            legacy: "~/.openclaw/workspace/paperclip-claimed-api-key.json"
+          }
+        },
+        localFiles: {
+          gatewayConfig: "~/.openclaw/openclaw.json",
+          keyOutputDirectory: "~/.openclaw/workspace/paperclip-agent-keys"
+        },
+        environment: {
+          OPENCLAW_AGENT_NAME: "optional display name override",
+          OPENCLAW_GATEWAY_URL:
+            "optional ws:// or wss:// gateway URL override",
+          OPENCLAW_GATEWAY_TOKEN:
+            "optional gateway token override; otherwise read from ~/.openclaw/openclaw.json"
+        },
+        singleCommand: {
+          shell: "sh",
+          description:
+            "Submit the OpenClaw Gateway join request using local OpenClaw config. It prints the one-time claimSecret; do not log it publicly.",
+          command: autoSetupCommand
+        }
+      },
       registrationEndpoint: {
         method: "POST",
         path: registrationEndpointPath,
@@ -1045,7 +1124,8 @@ function buildInviteOnboardingManifest(
       },
       claimEndpointTemplate: {
         method: "POST",
-        path: "/api/join-requests/{requestId}/claim-api-key",
+        path: claimEndpointTemplatePath,
+        url: claimEndpointTemplateUrl,
         body: {
           claimSecret:
             "one-time claim secret returned when the join request is created"
@@ -1093,8 +1173,13 @@ export function buildInviteOnboardingTextDocument(
   const manifest = buildInviteOnboardingManifest(req, token, invite, opts);
   const onboarding = manifest.onboarding as {
     inviteMessage?: string | null;
+    autoSetup?: {
+      humanApprovalBoundary?: string;
+      singleCommand?: { command?: string };
+      claim?: { outputPaths?: { perAgent?: string; legacy?: string } };
+    };
     registrationEndpoint: { method: string; path: string; url: string };
-    claimEndpointTemplate: { method: string; path: string };
+    claimEndpointTemplate: { method: string; path: string; url?: string };
     textInstructions: { path: string; url: string };
     skill: { path: string; url: string; installPath: string };
     connectivity: {
@@ -1141,7 +1226,22 @@ export function buildInviteOnboardingTextDocument(
   }
 
   appendBlock(`
-    ## Step 0
+    ## Automatic setup (preferred)
+
+    Paperclip exposes a machine-readable onboarding.autoSetup block at the JSON onboarding endpoint. It contains the registration endpoint, claim endpoint template, suggested output paths, and this copy-ready command.
+
+    Human approval boundary: ${
+      onboarding.autoSetup?.humanApprovalBoundary ??
+      "Submitting creates a join request only; board/admin approval is required before claim."
+    }
+
+    Run this inside the OpenClaw runtime to submit/replay the join request:
+
+    ${onboarding.autoSetup?.singleCommand?.command ?? "<auto-setup command unavailable>"}
+
+    Save the response. It includes request id, claimApiKeyPath, and a one-time claimSecret. Do not print the claimSecret in public logs.
+
+    ## Step 0 (manual fallback)
 
     Get the OpenClaw gateway auth token (THIS MUST BE SENT)
     Token lives in:
@@ -1230,8 +1330,15 @@ export function buildInviteOnboardingTextDocument(
 
     On successful claim, save the full JSON response to:
 
-    - ~/.openclaw/workspace/paperclip-claimed-api-key.json
-    chmod 600 ~/.openclaw/workspace/paperclip-claimed-api-key.json
+    - ${
+      onboarding.autoSetup?.claim?.outputPaths?.perAgent ??
+      "~/.openclaw/workspace/paperclip-agent-keys/<agent-name>.json"
+    }
+    - ${
+      onboarding.autoSetup?.claim?.outputPaths?.legacy ??
+      "~/.openclaw/workspace/paperclip-claimed-api-key.json"
+    } (legacy fallback)
+    chmod 600 ~/.openclaw/workspace/paperclip-agent-keys/<agent-name>.json ~/.openclaw/workspace/paperclip-claimed-api-key.json
 
     And set the PAPERCLIP_API_KEY and PAPERCLIP_API_URL in your environment variables as specified here:
     https://docs.openclaw.ai/help/environment
@@ -2464,12 +2571,39 @@ export function accessRoutes(
           invite,
           opts
         );
+        const claimApiKeyPath = `/api/join-requests/${created.id}/claim-api-key`;
+        const claimApiKeyUrl = requestBaseUrl(req)
+          ? `${requestBaseUrl(req)}${claimApiKeyPath}`
+          : claimApiKeyPath;
         res.status(202).json({
           ...response,
           claimSecret,
-          claimApiKeyPath: `/api/join-requests/${created.id}/claim-api-key`,
+          claimApiKeyPath,
           onboarding: onboardingManifest.onboarding,
-          diagnostics: joinDefaults.diagnostics
+          diagnostics: joinDefaults.diagnostics,
+          nextActions: {
+            humanApprovalRequired: true,
+            waitFor: "board/admin approval of this join request",
+            claimWhenApproved: {
+              method: "POST",
+              path: claimApiKeyPath,
+              url: claimApiKeyUrl,
+              body: { claimSecret },
+              saveResponseTo: {
+                perAgent:
+                  `~/.openclaw/workspace/paperclip-agent-keys/${
+                    created.agentName ?? "<agent-name>"
+                  }.json`,
+                legacy:
+                  "~/.openclaw/workspace/paperclip-claimed-api-key.json"
+              }
+            },
+            configureOpenClawEnv: {
+              PAPERCLIP_API_KEY: "token from saved claim response",
+              PAPERCLIP_API_URL:
+                joinDefaults.normalized?.paperclipApiUrl ?? requestBaseUrl(req)
+            }
+          }
         });
         return;
       }
@@ -2882,6 +3016,112 @@ export function accessRoutes(
       res.json(memberships);
     }
   );
+
+  // Endpoint to retrieve AgentHosting launch context (injected via headers during proxy)
+  router.get("/agenthosting/launch-context", async (req, res) => {
+    const contextHeader = req.header("x-agenthosting-launch-context");
+    if (!contextHeader) {
+      res.json({ available: false });
+      return;
+    }
+    try {
+      const decoded = Buffer.from(contextHeader, "base64").toString("utf8");
+      const parsed = JSON.parse(decoded);
+      // Return only safe, non-sensitive fields
+      res.json({
+        available: true,
+        agentId: parsed.agentId ?? null,
+        agentName: parsed.agentName ?? null,
+        openclawGatewayUrl: parsed.openclawGatewayUrl ?? null,
+        // Never expose tokens to the browser -- UI fetches them server-side
+      });
+    } catch {
+      res.json({ available: false });
+    }
+  });
+
+  // Auto-create company + agent from AgentHosting context and return redirect URL
+  router.post("/agenthosting/auto-onboard", async (req, res) => {
+    const contextHeader = req.header("x-agenthosting-launch-context");
+    if (!contextHeader) {
+      res.status(400).json({ error: "No launch context provided" });
+      return;
+    }
+
+    try {
+      const decoded = Buffer.from(contextHeader, "base64").toString("utf8");
+      const parsed = JSON.parse(decoded);
+      const agentName = parsed.agentName ?? "AgentHosting Agent";
+      const gatewayUrl = parsed.openclawGatewayUrl;
+      const gatewayToken = parsed.openclawGatewayToken;
+
+      // Create a default company named after the agent
+      const companyName = agentName.replace(/[^a-zA-Z0-9]/g, "") || "AgentHosting";
+
+      // Check if company already exists (simple name match)
+      const existingCompanies = await db.select().from(companies);
+      let company = existingCompanies.find((c: { name: string }) => c.name.toLowerCase() === companyName.toLowerCase());
+
+      if (!company) {
+        const [created] = await db.insert(companies).values({
+          name: companyName,
+          issuePrefix: companyName.substring(0, 3).toUpperCase(),
+          status: "active",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }).returning();
+        company = created;
+      }
+
+      // Build agent data based on adapter type
+      let adapterConfig: Record<string, unknown> = {};
+      let adapterType = "claude_local";
+
+      if (gatewayUrl) {
+        adapterType = "openclaw_gateway";
+        adapterConfig = {
+          url: gatewayUrl,
+          timeoutSec: 120,
+          waitTimeoutMs: 120000,
+          autoPairOnFirstConnect: true,
+        };
+
+        if (gatewayToken) {
+          adapterConfig.authToken = gatewayToken;
+        }
+      } else {
+        adapterConfig = {
+          model: "claude-sonnet-4-20250514",
+          thinkingEffort: "medium",
+          chrome: false,
+        };
+      }
+
+      const [createdAgent] = await db.insert(agentsTable).values({
+        name: agentName,
+        role: "ceo",
+        companyId: company.id,
+        adapterType,
+        adapterConfig,
+        status: "idle",
+        spentMonthlyCents: 0,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }).returning();
+
+      res.json({
+        success: true,
+        redirectUrl: `/${company.issuePrefix}`,
+        companyId: company.id,
+        companyPrefix: company.issuePrefix,
+        agentId: createdAgent.id,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error({ err: msg }, "Failed to auto-onboard from AgentHosting");
+      res.status(500).json({ error: "Auto-onboarding failed", details: msg });
+    }
+  });
 
   return router;
 }
